@@ -98,25 +98,33 @@ def detect_answers(grid_gray):
 
             q_no = col * 50 + row + 1
 
-            # ❗ SAFETY: Only record 1–200
+            # 🔥 Hard-protect q_no
             if q_no < 1 or q_no > 200:
                 continue
 
             row_y = row * bubble_h
-
             filled_darkness = []
+            invalid_roi_flag = False
 
             for opt_idx in range(5):
                 x = col * bubble_w + (opt_idx * 45)
                 y = row_y
 
-                roi = grid_gray[y:y + 50, x:x + 40]
-                thresh = cv2.threshold(roi, 180, 255, cv2.THRESH_BINARY_INV)[1]
+                roi = grid_gray[y:y+50, x:x+40]
 
+                # 🔥 Prevent zero-sized ROI → causes q_no = 0 bugs
+                if roi.size == 0:
+                    invalid_roi_flag = True
+                    break
+
+                thresh = cv2.threshold(roi, 180, 255, cv2.THRESH_BINARY_INV)[1]
                 dark_pixels = cv2.countNonZero(thresh)
                 filled_darkness.append(dark_pixels)
 
-            max_dark = max(filled_darkness)
+            if invalid_roi_flag:
+                answers[q_no] = "BLANK"
+                continue
+
             marked = [i for i, v in enumerate(filled_darkness) if v > 150]
 
             if len(marked) == 0:
@@ -127,6 +135,7 @@ def detect_answers(grid_gray):
                 answers[q_no] = options[marked[0]]
 
     return answers
+
 
 # ---------------------------------------------------
 # FastAPI Endpoint
