@@ -21,23 +21,40 @@ def read_image(uploaded_file):
 # Step 1 — Find OMR sheet border (largest rectangle)
 # --------------------------------------------------------
 def detect_sheet_contour(image):
+    # 1. Convert to grayscale
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (7, 7), 0)
-    edges = cv2.Canny(blur, 30, 150)
 
+    # 2. Increase contrast for light-pink OMR sheets
+    gray = cv2.equalizeHist(gray)
+
+    # 3. Remove noise
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # 4. Strong edge detection
+    edges = cv2.Canny(blur, 50, 150)
+
+    # 5. Dilate edges so borders appear as solid lines
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    edges = cv2.dilate(edges, kernel, iterations=2)
+
+    # 6. Find contours
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
     if not contours:
         return None
 
+    # 7. Pick largest 4-corner contour
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
-    sheet = contours[0]
-    peri = cv2.arcLength(sheet, True)
-    approx = cv2.approxPolyDP(sheet, 0.02 * peri, True)
 
-    if len(approx) == 4:
-        return approx.reshape(4, 2)
+    for cnt in contours:
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+
+        # Must be a rectangle (4 corners)
+        if len(approx) == 4:
+            return approx
+
     return None
+
 
 
 # --------------------------------------------------------
@@ -61,23 +78,40 @@ def order_points(pts):
 # --------------------------------------------------------
 # Step 3 — Warp to standard 1500x2200 canvas
 # --------------------------------------------------------
-def warp_sheet(image, pts):
-    rect = order_points(pts)
+def warp_sheet(image, contour):
+    pts = contour.reshape(4, 2)
+
+    # Order points: tl, tr, br, bl
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+
     (tl, tr, br, bl) = rect
 
-    width = 1500
-    height = 2200
+    widthA = np.linalg.norm(br - bl)
+    widthB = np.linalg.norm(tr - tl)
+    maxWidth = int(max(widthA, widthB))
+
+    heightA = np.linalg.norm(tr - br)
+    heightB = np.linalg.norm(tl - bl)
+    maxHeight = int(max(heightA, heightB))
 
     dst = np.array([
         [0, 0],
-        [width - 1, 0],
-        [width - 1, height - 1],
-        [0, height - 1]
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]
     ], dtype="float32")
 
     M = cv2.getPerspectiveTransform(rect, dst)
-    warp = cv2.warpPerspective(image, M, (width, height))
-    return warp
+    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+    return warped
+
 
 
 # --------------------------------------------------------
