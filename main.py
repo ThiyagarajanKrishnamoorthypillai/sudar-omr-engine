@@ -150,7 +150,13 @@ async def process_sheet(file: UploadFile):
         # Detect bubbles
         answers = detect_answers(grid)
 
-        return JSONResponse({"responses": answers}, status_code=200)
+         # Convert dict {"1":"A"} → list Laravel expects
+        formatted = [
+            {"q": int(q), "option": opt, "confidence": 1.0}
+            for q, opt in answers.items()
+        ]
+
+        return JSONResponse({"responses": formatted}, status_code=200)
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
