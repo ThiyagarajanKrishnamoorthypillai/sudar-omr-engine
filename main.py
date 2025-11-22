@@ -44,19 +44,18 @@ def detect_sheet_contour(image):
 def order_points(pts):
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]  # top-left
-    rect[2] = pts[np.argmax(s)]  # bottom-right
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
 
     diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # top-right
-    rect[3] = pts[np.argmax(diff)]  # bottom-left
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
 
     return rect
 
 def warp_perspective(image, pts):
     rect = order_points(pts)
 
-    # Output size for Sudar IAS OMR sheet
     (tl, tr, br, bl) = rect
     width = 2400
     height = 3400
@@ -73,25 +72,22 @@ def warp_perspective(image, pts):
     return warped
 
 # ---------------------------------------------------
-# Step 3 — Extract 200 bubbles grid from warped sheet
+# Step 3 — Extract answer grid region
 # ---------------------------------------------------
 def extract_bubble_grid(warped):
-    # Cropping coordinates for answer region
-    # These values match the Sudar IAS blank sheet layout
-    x1, y1 = 900, 250     # left-top of answer grid
-    x2, y2 = 2250, 3050   # right-bottom of answer grid
+    x1, y1 = 900, 250
+    x2, y2 = 2250, 3050
 
     grid = warped[y1:y2, x1:x2]
-    grid_gray = cv2.cvtColor(grid, cv2.COLOR_BGR2GRAY)
-    return grid_gray
+    return cv2.cvtColor(grid, cv2.COLOR_BGR2GRAY)
 
 # ---------------------------------------------------
 # Step 4 — Detect bubbles for 200 questions
 # ---------------------------------------------------
 def detect_answers(grid_gray):
     answers = {}
-    rows = 50  # per column
-    cols = 4   # column blocks
+    rows = 50
+    cols = 4
     options = ["A", "B", "C", "D", "E"]
 
     bubble_w = 250
@@ -99,7 +95,13 @@ def detect_answers(grid_gray):
 
     for col in range(cols):
         for row in range(rows):
+
             q_no = col * 50 + row + 1
+
+            # ❗ SAFETY: Only record 1–200
+            if q_no < 1 or q_no > 200:
+                continue
+
             row_y = row * bubble_h
 
             filled_darkness = []
@@ -108,7 +110,7 @@ def detect_answers(grid_gray):
                 x = col * bubble_w + (opt_idx * 45)
                 y = row_y
 
-                roi = grid_gray[y:y+50, x:x+40]
+                roi = grid_gray[y:y + 50, x:x + 40]
                 thresh = cv2.threshold(roi, 180, 255, cv2.THRESH_BINARY_INV)[1]
 
                 dark_pixels = cv2.countNonZero(thresh)
@@ -118,9 +120,9 @@ def detect_answers(grid_gray):
             marked = [i for i, v in enumerate(filled_darkness) if v > 150]
 
             if len(marked) == 0:
-                answers[q_no] = "-"
+                answers[q_no] = "BLANK"
             elif len(marked) > 1:
-                answers[q_no] = "M"
+                answers[q_no] = "MULTI"
             else:
                 answers[q_no] = options[marked[0]]
 
@@ -133,28 +135,30 @@ def detect_answers(grid_gray):
 async def process_sheet(file: UploadFile):
 
     try:
-        # Read image
         image = read_image(file)
 
-        # Detect sheet border
         contour = detect_sheet_contour(image)
         if contour is None:
             return JSONResponse({"error": "Sheet contour not found"}, status_code=400)
 
-        # Warp sheet
         warped = warp_perspective(image, contour)
 
-        # Extract grid region
         grid = extract_bubble_grid(warped)
 
-        # Detect bubbles
         answers = detect_answers(grid)
 
-         # Convert dict {"1":"A"} → list Laravel expects
-        formatted = [
-            {"q": int(q), "option": opt, "confidence": 1.0}
-            for q, opt in answers.items()
-        ]
+        # Format for Laravel OMRController
+        formatted = []
+        for q, opt in answers.items():
+            q = int(q)
+            if q < 1 or q > 200:
+                continue
+
+            formatted.append({
+                "q": q,
+                "option": opt,
+                "confidence": 1.0
+            })
 
         return JSONResponse({"responses": formatted}, status_code=200)
 
