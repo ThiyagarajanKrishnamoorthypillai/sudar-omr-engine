@@ -90,16 +90,20 @@ def detect_answers(grid_gray):
     cols = 4
     options = ["A", "B", "C", "D", "E"]
 
-    bubble_w = 250
-    bubble_h = 55
+    bubble_w = 250     # width block per 50 questions column
+    bubble_h = 55      # height per question
+
+    opt_w = 40         # width of bubble ROI
+    opt_h = 50         # height of bubble ROI
+    opt_gap = 45       # gap between options
 
     for col in range(cols):
         for row in range(rows):
 
             q_no = col * 50 + row + 1
 
-            # 🔥 Hard-protect q_no
-            if q_no < 1 or q_no > 200:
+            # strong guard
+            if not (1 <= q_no <= 200):
                 continue
 
             row_y = row * bubble_h
@@ -107,24 +111,30 @@ def detect_answers(grid_gray):
             invalid_roi_flag = False
 
             for opt_idx in range(5):
-                x = col * bubble_w + (opt_idx * 45)
+                x = col * bubble_w + (opt_idx * opt_gap)
                 y = row_y
 
-                roi = grid_gray[y:y+50, x:x+40]
+                # extract ROI safely
+                roi = grid_gray[y:y+opt_h, x:x+opt_w]
 
-                # 🔥 Prevent zero-sized ROI → causes q_no = 0 bugs
-                if roi.size == 0:
+                # strong ROI check
+                if roi.size == 0 or roi.shape[0] < 10 or roi.shape[1] < 10:
                     invalid_roi_flag = True
                     break
 
-                thresh = cv2.threshold(roi, 180, 255, cv2.THRESH_BINARY_INV)[1]
+                # noise-resistant thresholding
+                blur = cv2.GaussianBlur(roi, (5, 5), 0)
+                _, thresh = cv2.threshold(blur, 160, 255, cv2.THRESH_BINARY_INV)
+
                 dark_pixels = cv2.countNonZero(thresh)
                 filled_darkness.append(dark_pixels)
 
+            # If any one ROI was invalid → treat entire question as blank
             if invalid_roi_flag:
                 answers[q_no] = "BLANK"
                 continue
 
+            # determine chosen answer
             marked = [i for i, v in enumerate(filled_darkness) if v > 150]
 
             if len(marked) == 0:
@@ -135,7 +145,6 @@ def detect_answers(grid_gray):
                 answers[q_no] = options[marked[0]]
 
     return answers
-
 
 # ---------------------------------------------------
 # FastAPI Endpoint
@@ -173,3 +182,38 @@ async def process_sheet(file: UploadFile):
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+        
+def save_omr_responses(omr_sheet_id, answers, cursor, db):
+    """
+    omr_sheet_id : ID of omr_sheets table
+    answers      : output from detect_answers()
+    cursor       : MySQL cursor
+    db           : MySQL connection
+    """
+    
+    # Delete previous responses for same sheet (prevents duplicates)
+    cursor.execute("""
+        DELETE FROM omr_responses WHERE omr_sheet_id = %s
+    """, (omr_sheet_id,))
+    db.commit()
+
+    insert_sql = """
+        INSERT INTO omr_responses 
+        (omr_sheet_id, question_no, detected_option, confidence, final_option, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+    """
+
+    for q_no in range(1, 201):
+        detected = answers.get(q_no, "BLANK")
+
+        # For BLANK and MULTI, final_option = NULL
+        final_option = detected if detected in ["A", "B", "C", "D", "E"] else None
+
+        # Always detect with confidence=1 for now (future AI scoring)
+        data = (omr_sheet_id, q_no, detected, 1, final_option)
+
+        cursor.execute(insert_sql, data)
+
+    db.commit()
