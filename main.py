@@ -1,216 +1,156 @@
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, UploadFile
 from fastapi.responses import JSONResponse
-from typing import List
+from typing import Dict
 from PIL import Image
 import io
 
 app = FastAPI()
 
-# ------------------------------------------
+# ---------------------------------------------------
 # Utility: Read uploaded image as OpenCV BGR
-# ------------------------------------------
+# ---------------------------------------------------
 def read_image(uploaded_file):
     img_bytes = uploaded_file.file.read()
     pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-
-# --------------------------------------------------------
-# Step 1 — Find OMR sheet border (largest rectangle)
-# --------------------------------------------------------
+# ---------------------------------------------------
+# Step 1 — Find OMR sheet contour (largest rectangle)
+# ---------------------------------------------------
 def detect_sheet_contour(image):
-    # 1. Convert to grayscale
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    # 2. Increase contrast for light-pink OMR sheets
-    gray = cv2.equalizeHist(gray)
-
-    # 3. Remove noise
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    # 4. Strong edge detection
     edges = cv2.Canny(blur, 50, 150)
 
-    # 5. Dilate edges so borders appear as solid lines
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    edges = cv2.dilate(edges, kernel, iterations=2)
-
-    # 6. Find contours
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
 
-    # 7. Pick largest 4-corner contour
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
     for cnt in contours:
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-
-        # Must be a rectangle (4 corners)
         if len(approx) == 4:
-            return approx
+            return approx.reshape(4, 2)
 
     return None
 
-
-
-# --------------------------------------------------------
-# Step 2 — Order corners for warp
-# --------------------------------------------------------
+# ---------------------------------------------------
+# Step 2 — Warp sheet to top-down aligned view
+# ---------------------------------------------------
 def order_points(pts):
-    # order: TL, TR, BR, BL
     rect = np.zeros((4, 2), dtype="float32")
-
     s = pts.sum(axis=1)
-    diff = np.diff(pts, axis=1)
+    rect[0] = pts[np.argmin(s)]  # top-left
+    rect[2] = pts[np.argmax(s)]  # bottom-right
 
-    rect[0] = pts[np.argmin(s)]  # TL
-    rect[2] = pts[np.argmax(s)]  # BR
-    rect[1] = pts[np.argmin(diff)]  # TR
-    rect[3] = pts[np.argmax(diff)]  # BL
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]  # top-right
+    rect[3] = pts[np.argmax(diff)]  # bottom-left
 
     return rect
 
+def warp_perspective(image, pts):
+    rect = order_points(pts)
 
-# --------------------------------------------------------
-# Step 3 — Warp to standard 1500x2200 canvas
-# --------------------------------------------------------
-def warp_sheet(image, contour):
-    pts = contour.reshape(4, 2)
-
-    # Order points: tl, tr, br, bl
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-
+    # Output size for Sudar IAS OMR sheet
     (tl, tr, br, bl) = rect
-
-    widthA = np.linalg.norm(br - bl)
-    widthB = np.linalg.norm(tr - tl)
-    maxWidth = int(max(widthA, widthB))
-
-    heightA = np.linalg.norm(tr - br)
-    heightB = np.linalg.norm(tl - bl)
-    maxHeight = int(max(heightA, heightB))
+    width = 2400
+    height = 3400
 
     dst = np.array([
         [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]
+        [width - 1, 0],
+        [width - 1, height - 1],
+        [0, height - 1]
     ], dtype="float32")
 
     M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+    warped = cv2.warpPerspective(image, M, (width, height))
     return warped
 
+# ---------------------------------------------------
+# Step 3 — Extract 200 bubbles grid from warped sheet
+# ---------------------------------------------------
+def extract_bubble_grid(warped):
+    # Cropping coordinates for answer region
+    # These values match the Sudar IAS blank sheet layout
+    x1, y1 = 900, 250     # left-top of answer grid
+    x2, y2 = 2250, 3050   # right-bottom of answer grid
 
+    grid = warped[y1:y2, x1:x2]
+    grid_gray = cv2.cvtColor(grid, cv2.COLOR_BGR2GRAY)
+    return grid_gray
 
-# --------------------------------------------------------
-# Step 4 — Remove pink background
-# --------------------------------------------------------
-def remove_pink(image):
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+# ---------------------------------------------------
+# Step 4 — Detect bubbles for 200 questions
+# ---------------------------------------------------
+def detect_answers(grid_gray):
+    answers = {}
+    rows = 50  # per column
+    cols = 4   # column blocks
+    options = ["A", "B", "C", "D", "E"]
 
-    lower = np.array([140, 40, 40])
-    upper = np.array([179, 255, 255])
+    bubble_w = 250
+    bubble_h = 55
 
-    mask = cv2.inRange(hsv, lower, upper)
-    result = cv2.bitwise_not(mask)
-    return result
+    for col in range(cols):
+        for row in range(rows):
+            q_no = col * 50 + row + 1
+            row_y = row * bubble_h
 
+            filled_darkness = []
 
-# --------------------------------------------------------
-# Step 5 — Detect bubbles for 200 Q (A,B,C,D,E)
-# --------------------------------------------------------
-def detect_bubbles(warp):
+            for opt_idx in range(5):
+                x = col * bubble_w + (opt_idx * 45)
+                y = row_y
 
-    # Adaptive threshold
-    th = cv2.adaptiveThreshold(
-        warp, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-        cv2.THRESH_BINARY_INV, 35, 10
-    )
+                roi = grid_gray[y:y+50, x:x+40]
+                thresh = cv2.threshold(roi, 180, 255, cv2.THRESH_BINARY_INV)[1]
 
-    responses = []
-    bubble_w = 55
-    bubble_h = 33
-    start_x = 150
-    start_y = 300
-    row_gap = 35
-    col_gap = 280
+                dark_pixels = cv2.countNonZero(thresh)
+                filled_darkness.append(dark_pixels)
 
-    for i in range(200):
-        q_no = i + 1
-        block = i // 50
-        row = i % 50
+            max_dark = max(filled_darkness)
+            marked = [i for i, v in enumerate(filled_darkness) if v > 150]
 
-        x_offset = start_x + block * col_gap
-        y_offset = start_y + row * row_gap
+            if len(marked) == 0:
+                answers[q_no] = "-"
+            elif len(marked) > 1:
+                answers[q_no] = "M"
+            else:
+                answers[q_no] = options[marked[0]]
 
-        bubbles = []
-        for opt_index in range(5):  # A,B,C,D,E
-            x1 = x_offset + (opt_index * bubble_w)
-            y1 = y_offset
-            x2 = x1 + bubble_w
-            y2 = y1 + bubble_h
+    return answers
 
-            bubble_roi = th[y1:y2, x1:x2]
-            fill = np.sum(bubble_roi) / 255  # count white pixels
-
-            bubbles.append(fill)
-
-        # Determine selected option
-        max_val = max(bubbles)
-        max_idx = bubbles.index(max_val)
-
-        if max_val < 300:
-            selected = ""
-            confidence = 0
-        else:
-            selected = ["A", "B", "C", "D", "E"][max_idx]
-            confidence = round(max_val / 1000, 2)
-
-        responses.append({
-            "q": q_no,
-            "option": selected,
-            "confidence": float(confidence)
-        })
-
-    return responses
-
-
-# --------------------------------------------------------
-# FastAPI Endpoint — /process
-# --------------------------------------------------------
+# ---------------------------------------------------
+# FastAPI Endpoint
+# ---------------------------------------------------
 @app.post("/process")
-async def process_sheet(file: UploadFile = File(...)):
-    try:
-        img = read_image(file)
+async def process_sheet(file: UploadFile):
 
-        contour = detect_sheet_contour(img)
+    try:
+        # Read image
+        image = read_image(file)
+
+        # Detect sheet border
+        contour = detect_sheet_contour(image)
         if contour is None:
             return JSONResponse({"error": "Sheet contour not found"}, status_code=400)
 
-        warped = warp_sheet(img, contour)
-        warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+        # Warp sheet
+        warped = warp_perspective(image, contour)
 
-        cleaned = remove_pink(warped)
-        cleaned_gray = cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY)
+        # Extract grid region
+        grid = extract_bubble_grid(warped)
 
-        responses = detect_bubbles(cleaned_gray)
+        # Detect bubbles
+        answers = detect_answers(grid)
 
-        return {
-            "status": "success",
-            "responses": responses
-        }
+        return JSONResponse({"responses": answers}, status_code=200)
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
