@@ -153,26 +153,8 @@ def detect_answers(grid_gray):
 async def process_sheet(file: UploadFile):
 
     try:
-        # 1. Read uploaded image
         image = read_image(file)
 
-        # -----------------------------------------
-        # NEW PREPROCESSING (Fix MULTI issue)
-        # -----------------------------------------
-
-        # Convert to grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-        # Remove pink background (Sudar OMR Sheet is pink)
-        _, gray = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
-        gray = cv2.bitwise_not(gray)  # VERY IMPORTANT
-
-        # Replace original image with cleaned one
-        image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-
-        # -----------------------------------------
-        # Continue with your existing pipeline
-        # -----------------------------------------
         contour = detect_sheet_contour(image)
         if contour is None:
             return JSONResponse({"error": "Sheet contour not found"}, status_code=400)
@@ -200,7 +182,6 @@ async def process_sheet(file: UploadFile):
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
 
 
 
